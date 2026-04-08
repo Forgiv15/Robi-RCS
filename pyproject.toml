@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robi-rcs"
+version = "0.1.0"
+description = "Qt6/openEMS oriented RCS simulation desktop application"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PySide6",
+  "pyqtgraph",
+  "numpy",
+  "trimesh",
+  "pyvista",
+  "pyvistaqt",
+  "h5py",
+  "gmsh",
+  "imageio",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
