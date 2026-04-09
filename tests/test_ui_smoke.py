@@ -22,7 +22,7 @@ class UiSmokeTest(unittest.TestCase):
 
     def test_window_constructs_and_exports_visual_placeholders(self) -> None:
         window = MainWindow()
-        self.assertIn("openEMS", window.parameter_panel.install_detail.text())
+        self.assertIn("openEMS", window.parameter_panel.install_summary.text())
         self.assertIn("Általános állapot", window.results_panel.installation_view.toPlainText())
         window.results_panel.show_preflight("diagnostics ok")
         with tempfile.TemporaryDirectory() as temp_dir:

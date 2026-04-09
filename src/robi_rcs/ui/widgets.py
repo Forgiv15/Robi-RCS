@@ -411,13 +411,13 @@ class ParameterPanel(QWidget):
         super().__init__(parent)
         outer = QVBoxLayout(self)
         status_group = QGroupBox("Rendszer állapot")
+        status_group.setMaximumHeight(72)
         status_layout = QVBoxLayout(status_group)
         self.install_summary = QLabel("Telepítési állapot ellenőrzése...")
         self.install_summary.setWordWrap(True)
-        self.install_detail = QLabel("A GUI és az openEMS állapota itt jelenik meg.")
-        self.install_detail.setWordWrap(True)
+        self.install_detail = QLabel("")
+        self.install_detail.setVisible(False)
         status_layout.addWidget(self.install_summary)
-        status_layout.addWidget(self.install_detail)
         self.toolbox = QToolBox()
         outer.addWidget(status_group)
         outer.addWidget(self.toolbox)
@@ -692,9 +692,16 @@ class ParameterPanel(QWidget):
             color = "#b45309"
         else:
             color = "#b91c1c"
-        self.install_summary.setText(summary)
+        short_summary = summary
+        if openems_ready:
+            short_summary += " | openEMS OK"
+        elif ui_ready:
+            short_summary += " | openEMS nincs keszen"
+        else:
+            short_summary += " | GUI csomag hianyos"
+        self.install_summary.setText(short_summary)
         self.install_summary.setStyleSheet(f"color: {color}; font-weight: 600;")
-        self.install_detail.setText("\n".join(details))
+        self.install_summary.setToolTip("\n".join(details))
 
     def _make_form(self, title: str, rows: list[tuple[str, QWidget]]) -> QWidget:
         container = QGroupBox(title)

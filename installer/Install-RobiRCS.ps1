@@ -229,10 +229,48 @@ openEMS: hasznalhato
     $launcherContent = @"
 @echo off
 setlocal
-set "ROBI_RCS_HOME=%~dp0"
-set "OPENEMS_INSTALL_PATH=%ROBI_RCS_HOME%openEMS"
+title Robi RCS
+set "APP_ROOT=%~dp0"
+set "LOGFILE=%TEMP%\RobiRCSRun.log"
+
+if not exist "%APP_ROOT%main.py" (
+    echo [Robi RCS] HIBA: A telepitett main.py nem talalhato.
+    pause
+    exit /b 1
+)
+
+if not exist "%APP_ROOT%.venv\Scripts\python.exe" (
+    echo [Robi RCS] HIBA: A telepitett Python kornyezet nem talalhato.
+    echo [Robi RCS] Futtasd ujra az Install-RobiRCS.cmd fajlt.
+    pause
+    exit /b 1
+)
+
+pushd "%APP_ROOT%" >nul 2>&1
+if errorlevel 1 (
+    echo [Robi RCS] HIBA: Nem sikerult megnyitni a telepitett mappat.
+    pause
+    exit /b 1
+)
+
+set "ROBI_RCS_HOME=%APP_ROOT%"
+set "OPENEMS_INSTALL_PATH=%APP_ROOT%openEMS"
 set "PYTHONUTF8=1"
-"%ROBI_RCS_HOME%.venv\Scripts\python.exe" "%ROBI_RCS_HOME%main.py"
+echo [Robi RCS] Inditas innen: %APP_ROOT% > "%LOGFILE%"
+"%APP_ROOT%.venv\Scripts\python.exe" "%APP_ROOT%main.py" >> "%LOGFILE%" 2>&1
+set "EXITCODE=%ERRORLEVEL%"
+popd
+
+if not "%EXITCODE%"=="0" (
+    echo.
+    echo [Robi RCS] Az inditas hibaval leallt.
+    echo [Robi RCS] Naplo: %LOGFILE%
+    echo.
+    type "%LOGFILE%"
+    pause
+)
+
+exit /b %EXITCODE%
 "@
     $launcherContent.TrimStart() | Set-Content -Path $launcherPath -Encoding ASCII
 
