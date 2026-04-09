@@ -61,62 +61,63 @@ function New-Shortcut {
     $shortcut.Save()
 }
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$resolvedInstallDir = [System.IO.Path]::GetFullPath($InstallDir)
-$pythonExe = Resolve-PythonExe -UserPythonExe $PythonExe
-$venvDir = Join-Path $resolvedInstallDir '.venv'
-$venvPython = Join-Path $venvDir 'Scripts\python.exe'
-$openemsRoot = Join-Path $resolvedInstallDir 'openEMS'
+try {
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $resolvedInstallDir = [System.IO.Path]::GetFullPath($InstallDir)
+    $pythonExe = Resolve-PythonExe -UserPythonExe $PythonExe
+    $venvDir = Join-Path $resolvedInstallDir '.venv'
+    $venvPython = Join-Path $venvDir 'Scripts\python.exe'
+    $openemsRoot = Join-Path $resolvedInstallDir 'openEMS'
 
-Write-Step "Telepítési cél: $resolvedInstallDir"
-Write-Step "Python: $pythonExe"
+    Write-Step "Telepítési cél: $resolvedInstallDir"
+    Write-Step "Python: $pythonExe"
 
-New-Item -ItemType Directory -Force -Path $resolvedInstallDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $resolvedInstallDir | Out-Null
 
-$copyItems = @('main.py', 'pyproject.toml', 'README.md', 'docs', 'src', 'openEMS', 'Run-RobiRCS.cmd')
-foreach ($item in $copyItems) {
-    $source = Join-Path $repoRoot $item
-    if (-not (Test-Path $source)) {
-        throw "Hiányzó telepítési forrás: $source"
+    $copyItems = @('main.py', 'pyproject.toml', 'README.md', 'docs', 'src', 'openEMS', 'Run-RobiRCS.cmd')
+    foreach ($item in $copyItems) {
+        $source = Join-Path $repoRoot $item
+        if (-not (Test-Path $source)) {
+            throw "Hiányzó telepítési forrás: $source"
+        }
+        $destination = Join-Path $resolvedInstallDir $item
+        if (Test-Path $destination) {
+            Remove-Item -Path $destination -Recurse -Force
+        }
+        Copy-Item -Path $source -Destination $destination -Recurse -Force
     }
-    $destination = Join-Path $resolvedInstallDir $item
-    if (Test-Path $destination) {
-        Remove-Item -Path $destination -Recurse -Force
+
+    Write-Step 'Virtuális környezet létrehozása'
+    & $pythonExe -m venv $venvDir
+
+    Write-Step 'pip frissítése'
+    & $venvPython -m pip install --upgrade pip
+
+    Write-Step 'Robi RCS csomag telepítése'
+    & $venvPython -m pip install $resolvedInstallDir
+
+    $cpTag = & $venvPython -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+    $cpTag = $cpTag.Trim()
+    $csxWheel = Get-ChildItem -Path (Join-Path $openemsRoot 'python') -Filter "csxcad-*-$cpTag-$cpTag-win_amd64.whl" | Select-Object -First 1
+    $openemsWheel = Get-ChildItem -Path (Join-Path $openemsRoot 'python') -Filter "openems-*-$cpTag-$cpTag-win_amd64.whl" | Select-Object -First 1
+
+    if (-not $csxWheel -or -not $openemsWheel) {
+        throw "Nem található kompatibilis openEMS wheel a $cpTag ABI-hoz."
     }
-    Copy-Item -Path $source -Destination $destination -Recurse -Force
-}
 
-Write-Step 'Virtuális környezet létrehozása'
-& $pythonExe -m venv $venvDir
+    Write-Step 'openEMS Python bindingek telepítése'
+    & $venvPython -m pip install $csxWheel.FullName $openemsWheel.FullName
 
-Write-Step 'pip frissítése'
-& $venvPython -m pip install --upgrade pip
+    $buildDir = Join-Path $resolvedInstallDir 'build'
+    if (Test-Path $buildDir) {
+        Remove-Item -Path $buildDir -Recurse -Force
+    }
 
-Write-Step 'Robi RCS csomag telepítése'
-& $venvPython -m pip install $resolvedInstallDir
+    [Environment]::SetEnvironmentVariable('OPENEMS_INSTALL_PATH', $openemsRoot, 'User')
+    [Environment]::SetEnvironmentVariable('ROBI_RCS_HOME', $resolvedInstallDir, 'User')
 
-$cpTag = & $venvPython -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
-$cpTag = $cpTag.Trim()
-$csxWheel = Get-ChildItem -Path (Join-Path $openemsRoot 'python') -Filter "csxcad-*-$cpTag-$cpTag-win_amd64.whl" | Select-Object -First 1
-$openemsWheel = Get-ChildItem -Path (Join-Path $openemsRoot 'python') -Filter "openems-*-$cpTag-$cpTag-win_amd64.whl" | Select-Object -First 1
-
-if (-not $csxWheel -or -not $openemsWheel) {
-    throw "Nem található kompatibilis openEMS wheel a $cpTag ABI-hoz."
-}
-
-Write-Step 'openEMS Python bindingek telepítése'
-& $venvPython -m pip install $csxWheel.FullName $openemsWheel.FullName
-
-$buildDir = Join-Path $resolvedInstallDir 'build'
-if (Test-Path $buildDir) {
-    Remove-Item -Path $buildDir -Recurse -Force
-}
-
-[Environment]::SetEnvironmentVariable('OPENEMS_INSTALL_PATH', $openemsRoot, 'User')
-[Environment]::SetEnvironmentVariable('ROBI_RCS_HOME', $resolvedInstallDir, 'User')
-
-$launcherPath = Join-Path $resolvedInstallDir 'Run-RobiRCS.cmd'
-$launcherContent = @"
+    $launcherPath = Join-Path $resolvedInstallDir 'Run-RobiRCS.cmd'
+    $launcherContent = @"
 @echo off
 setlocal
 set "ROBI_RCS_HOME=%~dp0"
@@ -124,10 +125,10 @@ set "OPENEMS_INSTALL_PATH=%ROBI_RCS_HOME%openEMS"
 set "PYTHONUTF8=1"
 "%ROBI_RCS_HOME%.venv\Scripts\python.exe" "%ROBI_RCS_HOME%main.py"
 "@
-$launcherContent.TrimStart() | Set-Content -Path $launcherPath -Encoding ASCII
+    $launcherContent.TrimStart() | Set-Content -Path $launcherPath -Encoding ASCII
 
-$uninstallPath = Join-Path $resolvedInstallDir 'Uninstall-RobiRCS.ps1'
-$uninstallContent = @"
+    $uninstallPath = Join-Path $resolvedInstallDir 'Uninstall-RobiRCS.ps1'
+    $uninstallContent = @"
 
 [Environment]::SetEnvironmentVariable('OPENEMS_INSTALL_PATH', `$null, 'User')
 [Environment]::SetEnvironmentVariable('ROBI_RCS_HOME', `$null, 'User')
@@ -140,18 +141,24 @@ if (Test-Path `$startMenuShortcut) { Remove-Item `$startMenuShortcut -Force }
 `$target = '$resolvedInstallDir'
 if (Test-Path `$target) { Remove-Item `$target -Recurse -Force }
 "@
-$uninstallContent.Trim() | Set-Content -Path $uninstallPath -Encoding UTF8
+    $uninstallContent.Trim() | Set-Content -Path $uninstallPath -Encoding UTF8
 
-if (-not $NoDesktopShortcut) {
-    $desktopShortcut = Join-Path $env:USERPROFILE 'Desktop\Robi RCS.lnk'
-    New-Shortcut -ShortcutPath $desktopShortcut -TargetPath $launcherPath -WorkingDirectory $resolvedInstallDir -Description 'Robi RCS indító'
+    if (-not $NoDesktopShortcut) {
+        $desktopShortcut = Join-Path $env:USERPROFILE 'Desktop\Robi RCS.lnk'
+        New-Shortcut -ShortcutPath $desktopShortcut -TargetPath $launcherPath -WorkingDirectory $resolvedInstallDir -Description 'Robi RCS indító'
+    }
+
+    if (-not $NoStartMenuShortcut) {
+        $startMenuDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+        New-Shortcut -ShortcutPath (Join-Path $startMenuDir 'Robi RCS.lnk') -TargetPath $launcherPath -WorkingDirectory $resolvedInstallDir -Description 'Robi RCS indító'
+    }
+
+    Write-Step 'Telepítés kész.'
+    Write-Step "Indító: $launcherPath"
+    Write-Step "openEMS könyvtár: $openemsRoot"
+    exit 0
 }
-
-if (-not $NoStartMenuShortcut) {
-    $startMenuDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
-    New-Shortcut -ShortcutPath (Join-Path $startMenuDir 'Robi RCS.lnk') -TargetPath $launcherPath -WorkingDirectory $resolvedInstallDir -Description 'Robi RCS indító'
+catch {
+    Write-Host "[Robi RCS] HIBA: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
 }
-
-Write-Step 'Telepítés kész.'
-Write-Step "Indító: $launcherPath"
-Write-Step "openEMS könyvtár: $openemsRoot"
