@@ -27,6 +27,7 @@ class MaterialSettings:
     conductivity_s_per_m: float = 5.8e7
     loss_tangent: float = 0.0
     anisotropy: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    custom_presets: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

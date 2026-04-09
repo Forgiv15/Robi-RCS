@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -32,6 +33,10 @@ DETAIL_TO_CPW = {
     "fine": 24,
     "expert": 30,
 }
+
+
+class SimulationCancelledError(RuntimeError):
+    pass
 
 OPENEMS_TEMPLATE = """from __future__ import annotations
 
@@ -285,15 +290,42 @@ def prepare_openems_job(
     return run_dir
 
 
-def run_openems_job(project: ProjectModel, run_dir: Path, python_command: str | None = None) -> SimulationResult:
+def run_openems_job(
+    project: ProjectModel,
+    run_dir: Path,
+    python_command: str | None = None,
+    cancel_event: threading.Event | None = None,
+    process_callback=None,
+) -> SimulationResult:
     python_command = (python_command or project.solver.openems_python_command).strip()
     if not python_command:
         python_command = sys.executable
 
     cmd = [python_command, str(run_dir / "run_openems_job.py")]
-    process = subprocess.run(cmd, cwd=run_dir, capture_output=True, text=True, timeout=max(int(project.mesh.target_runtime_minutes * 60 * 3), 300))
+    timeout_seconds = max(int(project.mesh.target_runtime_minutes * 60 * 3), 300)
+    deadline = time.monotonic() + timeout_seconds
+    process = subprocess.Popen(cmd, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if process_callback is not None:
+        process_callback(process)
+
+    try:
+        while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                _terminate_process(process)
+                raise SimulationCancelledError("A szimulacio felhasznaloi keresre megszakadt.")
+            if time.monotonic() > deadline:
+                _terminate_process(process)
+                raise RuntimeError("Az openEMS futas idotullepes miatt leallt.")
+            time.sleep(0.1)
+
+        stdout, stderr = process.communicate()
+    finally:
+        if process_callback is not None:
+            process_callback(None)
+
     if process.returncode != 0:
-        stderr = process.stderr.strip() or process.stdout.strip()
+        stderr = stderr.strip() or stdout.strip()
         raise RuntimeError(stderr or "Az openEMS futás sikertelen volt.")
 
     result_path = run_dir / "result.json"
@@ -304,6 +336,18 @@ def run_openems_job(project: ProjectModel, run_dir: Path, python_command: str | 
     result = _result_from_dict(data, synthetic=False)
     result.run_directory = str(run_dir)
     return result
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except Exception:
+            pass
 
 
 def create_synthetic_result(mesh: trimesh.Trimesh, geometry_info: GeometryInfo, project: ProjectModel) -> SimulationResult:

@@ -9,7 +9,7 @@ import pyqtgraph as pg
 import pyvista as pv
 from pyqtgraph.exporters import ImageExporter
 from pyvistaqt import QtInteractor
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QPushButton,
     QProgressBar,
     QPlainTextEdit,
@@ -35,6 +36,47 @@ from PySide6.QtWidgets import (
 )
 
 from robi_rcs.models import MeshPlan, ProjectModel
+
+
+MATERIAL_PRESETS: dict[str, dict[str, float]] = {
+    "PEC": {
+        "epsilon_r": 1.0,
+        "mu_r": 1.0,
+        "conductivity_s_per_m": 5.8e7,
+        "loss_tangent": 0.0,
+    },
+    "Lossy Dielectric": {
+        "epsilon_r": 4.2,
+        "mu_r": 1.0,
+        "conductivity_s_per_m": 0.02,
+        "loss_tangent": 0.02,
+    },
+    "Good Conductor": {
+        "epsilon_r": 1.0,
+        "mu_r": 1.0,
+        "conductivity_s_per_m": 1.0e6,
+        "loss_tangent": 0.0,
+    },
+    "RAM": {
+        "epsilon_r": 2.5,
+        "mu_r": 1.0,
+        "conductivity_s_per_m": 12.0,
+        "loss_tangent": 0.12,
+    },
+    "Custom Isotropic": {
+        "epsilon_r": 1.0,
+        "mu_r": 1.0,
+        "conductivity_s_per_m": 0.0,
+        "loss_tangent": 0.0,
+    },
+}
+
+DETAIL_PRESET_VALUES: dict[str, tuple[int, int]] = {
+    "coarse": (12, 2),
+    "normal": (18, 3),
+    "fine": (24, 4),
+    "expert": (30, 5),
+}
 
 
 def _build_viewer_or_placeholder(parent: QWidget, message: str) -> tuple[QWidget, QtInteractor | None]:
@@ -58,17 +100,25 @@ def _build_viewer_or_placeholder(parent: QWidget, message: str) -> tuple[QWidget
 
 
 class LogPanel(QWidget):
+    cancelRequested = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
+        header = QHBoxLayout()
         self.status_label = QLabel("Idle")
+        self.cancel_button = QPushButton("Szimulacio megszakitasa")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancelRequested.emit)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.summary_label = QLabel("Numerikus összefoglaló még nincs.")
         self.summary_label.setWordWrap(True)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        layout.addWidget(self.status_label)
+        header.addWidget(self.status_label, 1)
+        header.addWidget(self.cancel_button)
+        layout.addLayout(header)
         layout.addWidget(self.progress)
         layout.addWidget(self.summary_label)
         layout.addWidget(self.log_view, 1)
@@ -83,6 +133,9 @@ class LogPanel(QWidget):
 
     def set_summary(self, text: str) -> None:
         self.summary_label.setText(text)
+
+    def set_running_state(self, running: bool) -> None:
+        self.cancel_button.setEnabled(running)
 
 
 class PreviewPanel(QWidget):
@@ -100,9 +153,12 @@ class PreviewPanel(QWidget):
         self._polydata: pv.PolyData | None = None
         self._actor = None
 
-    def set_mesh(self, mesh, geometry_info, scalars: np.ndarray | None = None, scalar_name: str = "surface") -> None:
+    def set_mesh(self, mesh, geometry_info, project: ProjectModel | None = None, scalars: np.ndarray | None = None, scalar_name: str = "surface") -> None:
         if self.viewer is None:
-            self.info.setText("3D OpenGL nézet nem elérhető, de a geometria sikeresen be lett töltve.")
+            fallback_text = ["3D OpenGL nézet nem elérhető, de a geometria sikeresen be lett töltve."]
+            if project is not None:
+                fallback_text.append(f"Beeses: az={project.excitation.azimuth_deg:.1f} deg, el={project.excitation.elevation_deg:.1f} deg")
+            self.info.setText("\n".join(fallback_text))
             return
         self.viewer.clear()
         self.viewer.add_axes()
@@ -121,20 +177,21 @@ class PreviewPanel(QWidget):
             }
         self._actor = self.viewer.add_mesh(poly, **kwargs)
         self.viewer.add_bounding_box(color="#cbd5e1")
+        if project is not None:
+            self._add_incident_arrow(geometry_info, project)
         self.viewer.reset_camera()
-        self.info.setText(
-            "\n".join(
-                [
-                    f"Fájlformátum: {geometry_info.file_format.upper()}",
-                    f"Kiterjedés [m]: {geometry_info.extents_m[0]:.4g} x {geometry_info.extents_m[1]:.4g} x {geometry_info.extents_m[2]:.4g}",
-                    f"Háromszögek: {geometry_info.triangle_count}",
-                    f"Watertight: {'igen' if geometry_info.watertight else 'nem'}",
-                    f"Felület [m²]: {geometry_info.surface_area_m2:.4g}",
-                ]
-            )
-        )
+        info_lines = [
+            f"Fájlformátum: {geometry_info.file_format.upper()}",
+            f"Kiterjedés [m]: {geometry_info.extents_m[0]:.4g} x {geometry_info.extents_m[1]:.4g} x {geometry_info.extents_m[2]:.4g}",
+            f"Háromszögek: {geometry_info.triangle_count}",
+            f"Watertight: {'igen' if geometry_info.watertight else 'nem'}",
+            f"Felület [m²]: {geometry_info.surface_area_m2:.4g}",
+        ]
+        if project is not None:
+            info_lines.append(f"Beeses: az={project.excitation.azimuth_deg:.1f} deg, el={project.excitation.elevation_deg:.1f} deg")
+        self.info.setText("\n".join(info_lines))
 
-    def show_mesh_plan(self, geometry_info, mesh_plan: MeshPlan) -> None:
+    def show_mesh_plan(self, geometry_info, mesh_plan: MeshPlan, project: ProjectModel | None = None) -> None:
         if self.viewer is None:
             self.info.setText("A mesh terv elkészült, de a 3D megjelenítés ebben a környezetben nem érhető el.")
             return
@@ -144,19 +201,49 @@ class PreviewPanel(QWidget):
         bbox = pv.Cube(center=geometry_info.center_m, x_length=geometry_info.extents_m[0], y_length=geometry_info.extents_m[1], z_length=geometry_info.extents_m[2])
         self.viewer.add_mesh(domain, style="wireframe", color="#f59e0b", line_width=1)
         self.viewer.add_mesh(bbox, style="wireframe", color="#38bdf8", line_width=2)
+        if project is not None:
+            self._add_incident_arrow(geometry_info, project)
         self.viewer.reset_camera()
-        self.info.setText(
-            "\n".join(
-                [
-                    f"Alap cellaméret [m]: {mesh_plan.base_cell_size_m:.4g}",
-                    f"Cellák: {mesh_plan.cells_xyz[0]} x {mesh_plan.cells_xyz[1]} x {mesh_plan.cells_xyz[2]}",
-                    f"Összes cella: {mesh_plan.total_cells:,}",
-                    f"RAM becslés [GB]: {mesh_plan.estimated_memory_gb:.2f}",
-                    f"Idő becslés [perc]: {mesh_plan.estimated_runtime_minutes:.1f}",
-                    f"Minőség: {mesh_plan.quality_label}",
-                ]
-            )
-        )
+        info_lines = [
+            f"Alap cellaméret [m]: {mesh_plan.base_cell_size_m:.4g}",
+            f"Cellák: {mesh_plan.cells_xyz[0]} x {mesh_plan.cells_xyz[1]} x {mesh_plan.cells_xyz[2]}",
+            f"Összes cella: {mesh_plan.total_cells:,}",
+            f"RAM becslés [GB]: {mesh_plan.estimated_memory_gb:.2f}",
+            f"Idő becslés [perc]: {mesh_plan.estimated_runtime_minutes:.1f}",
+            f"Minőség: {mesh_plan.quality_label}",
+        ]
+        if project is not None:
+            info_lines.append(f"Beeses: az={project.excitation.azimuth_deg:.1f} deg, el={project.excitation.elevation_deg:.1f} deg")
+        self.info.setText("\n".join(info_lines))
+
+    def _add_incident_arrow(self, geometry_info, project: ProjectModel) -> None:
+        if self.viewer is None:
+            return
+        direction = self._incident_direction(project)
+        length = max(max(geometry_info.extents_m) * 0.85, mesh_safe_length(geometry_info))
+        start = np.array(geometry_info.center_m, dtype=float) - direction * length * 1.2
+        try:
+            self.viewer.add_arrows(start[None, :], direction[None, :], mag=length, color="#ef4444")
+        except Exception:
+            arrow = pv.Arrow(start=start, direction=direction, scale=length)
+            self.viewer.add_mesh(arrow, color="#ef4444")
+
+    def _incident_direction(self, project: ProjectModel) -> np.ndarray:
+        az = math.radians(project.excitation.azimuth_deg)
+        el = math.radians(project.excitation.elevation_deg)
+        direction = np.array([
+            math.cos(el) * math.cos(az),
+            math.cos(el) * math.sin(az),
+            math.sin(el),
+        ])
+        norm = np.linalg.norm(direction)
+        if norm <= 0.0:
+            return np.array([1.0, 0.0, 0.0])
+        return direction / norm
+
+
+def mesh_safe_length(geometry_info) -> float:
+    return max(max(geometry_info.extents_m), 1.0e-3)
 
 
 class Animation2DWidget(QWidget):
@@ -302,11 +389,11 @@ class ResultsPanel(QWidget):
         self.tabs.addTab(self.export_notes, "Exportálás")
         self.tabs.addTab(self.logs_copy, "Napló/Hibák")
 
-    def show_geometry(self, mesh, geometry_info) -> None:
-        self.geometry_preview.set_mesh(mesh, geometry_info)
+    def show_geometry(self, mesh, geometry_info, project: ProjectModel | None = None) -> None:
+        self.geometry_preview.set_mesh(mesh, geometry_info, project=project)
 
-    def show_mesh_plan(self, geometry_info, mesh_plan: MeshPlan) -> None:
-        self.mesh_preview.show_mesh_plan(geometry_info, mesh_plan)
+    def show_mesh_plan(self, geometry_info, mesh_plan: MeshPlan, project: ProjectModel | None = None) -> None:
+        self.mesh_preview.show_mesh_plan(geometry_info, mesh_plan, project=project)
         warning_text = "\n".join(mesh_plan.warnings) if mesh_plan.warnings else "Nincs kritikus figyelmeztetés."
         self.runtime_summary.setPlainText(
             "\n".join(
@@ -328,7 +415,7 @@ class ResultsPanel(QWidget):
     def show_installation_status(self, text: str) -> None:
         self.installation_view.setPlainText(text)
 
-    def show_result(self, mesh, geometry_info, result) -> None:
+    def show_result(self, mesh, geometry_info, result, project: ProjectModel | None = None) -> None:
         self.rcs_plot.clear()
         self.rcs_plot.addLegend()
         self.rcs_plot.plot(result.frequencies_hz, result.rcs_m2, pen=pg.mkPen("#38bdf8", width=2), name="RCS total")
@@ -340,7 +427,7 @@ class ResultsPanel(QWidget):
         self.pol_plot.plot(result.angular_phi_deg, result.angular_rcs_m2, pen=pg.mkPen("#e879f9", width=2), name="Angular cut")
 
         scalars = np.array(result.surface_intensity, dtype=float) if result.surface_intensity else None
-        self.surface_preview.set_mesh(mesh, geometry_info, scalars=scalars, scalar_name="surface_proxy")
+        self.surface_preview.set_mesh(mesh, geometry_info, project=project, scalars=scalars, scalar_name="surface_proxy")
         self._set_animation_frames(result)
         synthetic_label = "szintetikus preview" if result.synthetic else "openEMS solver eredmény"
         self.export_notes.setPlainText(
@@ -407,8 +494,12 @@ class ResultsPanel(QWidget):
 
 
 class ParameterPanel(QWidget):
+    projectChanged = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._suspend_updates = False
+        self.custom_material_presets: dict[str, dict[str, float]] = {}
         outer = QVBoxLayout(self)
         status_group = QGroupBox("Rendszer állapot")
         status_group.setMaximumHeight(72)
@@ -432,7 +523,7 @@ class ParameterPanel(QWidget):
         self.auto_repair.setChecked(True)
 
         self.material_preset = QComboBox()
-        self.material_preset.addItems(["PEC", "Lossy Dielectric", "Good Conductor", "RAM", "Custom Isotropic"])
+        self.add_material_button = QPushButton("+ anyag")
         self.epsilon_r = self._double_spin(1.0, 1000.0, 1.0, 4)
         self.mu_r = self._double_spin(1.0, 1000.0, 1.0, 4)
         self.conductivity = self._double_spin(0.0, 1e9, 5.8e7, 2)
@@ -495,7 +586,11 @@ class ParameterPanel(QWidget):
         self.threads.setRange(0, 64)
         self.threads.setValue(0)
 
+        self._sync_material_preset_items()
         self._add_sections()
+        self._connect_live_updates()
+        self._apply_selected_material_preset(self.material_preset.currentText(), emit_change=False)
+        self._apply_detail_preset(self.detail_preset.currentText(), emit_change=False)
 
     def _add_sections(self) -> None:
         self.toolbox.addItem(self._make_form("Projekt", [("Projekt név", self.project_name), ("Leírás", self.description)]), "Projekt")
@@ -515,7 +610,7 @@ class ParameterPanel(QWidget):
             self._make_form(
                 "Anyag",
                 [
-                    ("Preset", self.material_preset),
+                    ("Preset", self._build_material_preset_row()),
                     ("Epsilon_r", self.epsilon_r),
                     ("Mu_r", self.mu_r),
                     ("Vezetőképesség [S/m]", self.conductivity),
@@ -600,6 +695,7 @@ class ParameterPanel(QWidget):
         project.material.mu_r = self.mu_r.value()
         project.material.conductivity_s_per_m = self.conductivity.value()
         project.material.loss_tangent = self.loss_tangent.value()
+        project.material.custom_presets = dict(self.custom_material_presets)
         project.frequency.start_hz = self.freq_start.value() * 1e9
         project.frequency.stop_hz = self.freq_stop.value() * 1e9
         project.frequency.samples = self.freq_samples.value()
@@ -633,6 +729,9 @@ class ParameterPanel(QWidget):
         return project
 
     def apply_project(self, project: ProjectModel) -> None:
+        self._suspend_updates = True
+        self.custom_material_presets = dict(project.material.custom_presets)
+        self._sync_material_preset_items(project.material.preset)
         self.project_name.setText(project.project_name)
         self.description.setPlainText(project.description)
         self.geometry_path.setText(project.geometry.file_path)
@@ -674,6 +773,8 @@ class ParameterPanel(QWidget):
         self.end_criteria.setValue(project.solver.end_criteria)
         self.max_timesteps.setValue(project.solver.max_timesteps)
         self.threads.setValue(project.solver.num_threads)
+        self._suspend_updates = False
+        self._emit_project_changed()
 
     def set_geometry_path(self, path: str) -> None:
         self.geometry_path.setText(path)
@@ -702,6 +803,133 @@ class ParameterPanel(QWidget):
         self.install_summary.setText(short_summary)
         self.install_summary.setStyleSheet(f"color: {color}; font-weight: 600;")
         self.install_summary.setToolTip("\n".join(details))
+
+    def _build_material_preset_row(self) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.material_preset, 1)
+        layout.addWidget(self.add_material_button)
+        return container
+
+    def _connect_live_updates(self) -> None:
+        for line_edit in (self.project_name, self.geometry_path, self.output_dir, self.openems_python):
+            line_edit.editingFinished.connect(self._emit_project_changed)
+        self.description.textChanged.connect(self._emit_project_changed)
+        for combo in (
+            self.geometry_unit,
+            self.material_preset,
+            self.sweep_type,
+            self.sim_mode,
+            self.polarization,
+            self.excitation_type,
+            self.detail_preset,
+        ):
+            combo.currentTextChanged.connect(self._emit_project_changed)
+        for checkbox in (self.auto_repair, self.auto_mesh, self.setup_only):
+            checkbox.toggled.connect(self._emit_project_changed)
+        for spin in (
+            self.scale,
+            self.epsilon_r,
+            self.mu_r,
+            self.conductivity,
+            self.loss_tangent,
+            self.freq_start,
+            self.freq_stop,
+            self.freq_samples,
+            self.reference_freq,
+            self.azimuth,
+            self.elevation,
+            self.obs_azimuth,
+            self.obs_elevation,
+            self.amplitude,
+            self.cells_per_wavelength,
+            self.detail_level,
+            self.max_growth_ratio,
+            self.target_runtime,
+            self.max_memory,
+            self.pml_cells,
+            self.cfl,
+            self.animation_fps,
+            self.animation_frames,
+            self.end_criteria,
+            self.max_timesteps,
+            self.threads,
+        ):
+            spin.valueChanged.connect(self._emit_project_changed)
+        self.material_preset.currentTextChanged.connect(self._on_material_preset_changed)
+        self.detail_preset.currentTextChanged.connect(self._on_detail_preset_changed)
+        self.add_material_button.clicked.connect(self._on_add_material_preset)
+
+    def _emit_project_changed(self) -> None:
+        if not self._suspend_updates:
+            self.projectChanged.emit()
+
+    def _all_material_presets(self) -> dict[str, dict[str, float]]:
+        presets = dict(MATERIAL_PRESETS)
+        presets.update(self.custom_material_presets)
+        return presets
+
+    def _sync_material_preset_items(self, preferred: str | None = None) -> None:
+        preferred_name = preferred or self.material_preset.currentText() or "PEC"
+        with QSignalBlocker(self.material_preset):
+            self.material_preset.clear()
+            self.material_preset.addItems(list(self._all_material_presets().keys()))
+            index = self.material_preset.findText(preferred_name)
+            self.material_preset.setCurrentIndex(index if index >= 0 else 0)
+        self._apply_selected_material_preset(self.material_preset.currentText(), emit_change=False)
+
+    def _current_material_values(self) -> dict[str, float]:
+        return {
+            "epsilon_r": self.epsilon_r.value(),
+            "mu_r": self.mu_r.value(),
+            "conductivity_s_per_m": self.conductivity.value(),
+            "loss_tangent": self.loss_tangent.value(),
+        }
+
+    def _on_material_preset_changed(self, preset_name: str) -> None:
+        self._apply_selected_material_preset(preset_name, emit_change=True)
+
+    def _apply_selected_material_preset(self, preset_name: str, emit_change: bool) -> None:
+        values = self._all_material_presets().get(preset_name)
+        if values is None:
+            return
+        previous_state = self._suspend_updates
+        self._suspend_updates = True
+        self.epsilon_r.setValue(float(values.get("epsilon_r", self.epsilon_r.value())))
+        self.mu_r.setValue(float(values.get("mu_r", self.mu_r.value())))
+        self.conductivity.setValue(float(values.get("conductivity_s_per_m", self.conductivity.value())))
+        self.loss_tangent.setValue(float(values.get("loss_tangent", self.loss_tangent.value())))
+        self._suspend_updates = previous_state
+        if emit_change:
+            self._emit_project_changed()
+
+    def _on_detail_preset_changed(self, preset_name: str) -> None:
+        self._apply_detail_preset(preset_name, emit_change=True)
+
+    def _apply_detail_preset(self, preset_name: str, emit_change: bool) -> None:
+        values = DETAIL_PRESET_VALUES.get(preset_name)
+        if values is None:
+            return
+        cpw, detail_level = values
+        previous_state = self._suspend_updates
+        self._suspend_updates = True
+        self.cells_per_wavelength.setValue(cpw)
+        self.detail_level.setValue(detail_level)
+        self._suspend_updates = previous_state
+        if emit_change:
+            self._emit_project_changed()
+
+    def _on_add_material_preset(self) -> None:
+        name, accepted = QInputDialog.getText(self, "Uj anyag preset", "Preset neve:")
+        if not accepted:
+            return
+        preset_name = name.strip()
+        if not preset_name:
+            return
+        self.custom_material_presets[preset_name] = self._current_material_values()
+        self._sync_material_preset_items(preset_name)
+        self._emit_project_changed()
 
     def _make_form(self, title: str, rows: list[tuple[str, QWidget]]) -> QWidget:
         container = QGroupBox(title)

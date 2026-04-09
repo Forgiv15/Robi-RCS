@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 import imageio.v2 as imageio
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from robi_rcs.models import ProjectModel
 from robi_rcs.services.backend import (
+    SimulationCancelledError,
     create_mesh_plan,
     create_synthetic_result,
     load_geometry,
@@ -41,6 +43,7 @@ class SimulationWorker(QObject):
     log = Signal(str, str)
     finished = Signal(object)
     failed = Signal(str)
+    cancelled = Signal(str)
 
     def __init__(self, project: ProjectModel, mesh, geometry_info, mesh_plan) -> None:
         super().__init__()
@@ -48,17 +51,39 @@ class SimulationWorker(QObject):
         self.mesh = mesh
         self.geometry_info = geometry_info
         self.mesh_plan = mesh_plan
+        self._cancel_event = threading.Event()
+        self._active_process = None
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        process = self._active_process
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+
+    def _set_active_process(self, process) -> None:
+        self._active_process = process
+
+    def _ensure_not_cancelled(self) -> None:
+        if self._cancel_event.is_set():
+            raise SimulationCancelledError("A szimulacio megszakitva.")
 
     def run(self) -> None:
         try:
+            self._ensure_not_cancelled()
             self.progress.emit(15, "Job előkészítés")
             self.log.emit("INFO", "openEMS job könyvtár előkészítése")
             run_dir = prepare_openems_job(self.project, self.mesh, self.geometry_info, self.mesh_plan)
+            self._ensure_not_cancelled()
             self.progress.emit(35, "Solver környezet ellenőrzése")
             backend_status = inspect_openems_backend(self.project.solver.openems_python_command)
             for detail in backend_status.details[:2]:
                 self.log.emit("INFO" if backend_status.available else "WARNING", detail)
             if self.project.solver.setup_only:
+                self._ensure_not_cancelled()
                 self.log.emit("INFO", "Csak input generálás történt, solver futtatás nélkül.")
                 self.progress.emit(60, "Input generálva")
                 result = create_synthetic_result(self.mesh, self.geometry_info, self.project)
@@ -68,18 +93,33 @@ class SimulationWorker(QObject):
                     raise RuntimeError("A megadott openEMS Python környezet nem importálja egyszerre az openEMS és CSXCAD modulokat.")
                 self.log.emit("INFO", "Külső openEMS Python környezet használata")
                 self.progress.emit(55, "openEMS futtatás")
-                result = run_openems_job(self.project, run_dir, python_command=backend_status.executable)
+                result = run_openems_job(
+                    self.project,
+                    run_dir,
+                    python_command=backend_status.executable,
+                    cancel_event=self._cancel_event,
+                    process_callback=self._set_active_process,
+                )
             elif backend_status.available:
                 self.log.emit("INFO", "Bundled openEMS Python környezet használata")
                 self.progress.emit(55, "openEMS futtatás")
-                result = run_openems_job(self.project, run_dir, python_command=backend_status.executable)
+                result = run_openems_job(
+                    self.project,
+                    run_dir,
+                    python_command=backend_status.executable,
+                    cancel_event=self._cancel_event,
+                    process_callback=self._set_active_process,
+                )
             else:
+                self._ensure_not_cancelled()
                 self.log.emit("WARNING", "openEMS környezet nincs megadva, szintetikus eredmény készül")
                 self.progress.emit(55, "Szintetikus eredmény generálása")
                 result = create_synthetic_result(self.mesh, self.geometry_info, self.project)
             result.run_directory = str(run_dir)
             self.progress.emit(100, "Kész")
             self.finished.emit(result)
+        except SimulationCancelledError as exc:
+            self.cancelled.emit(str(exc))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -103,7 +143,10 @@ class MainWindow(QMainWindow):
         self.current_result = None
         self.current_preflight_report = None
         self.current_runtime_status = None
+        self.current_geometry_signature = None
         self.worker_thread: QThread | None = None
+        self.worker: SimulationWorker | None = None
+        self.cancel_action: QAction | None = None
 
         backend_status = inspect_openems_backend("")
         if backend_status.available:
@@ -112,7 +155,9 @@ class MainWindow(QMainWindow):
         self._build_layout()
         self._build_actions()
         self.parameter_panel.apply_project(self.current_project)
+        self.parameter_panel.projectChanged.connect(self._on_parameters_changed)
         self.parameter_panel.openems_python.editingFinished.connect(self._refresh_runtime_status)
+        self.log_panel.cancelRequested.connect(self.cancel_simulation)
         self._refresh_runtime_status()
 
     def _build_layout(self) -> None:
@@ -136,6 +181,9 @@ class MainWindow(QMainWindow):
 
     def _build_actions(self) -> None:
         toolbar = self.addToolBar("Main")
+        self.cancel_action = QAction("Szimulacio megszakitasa", self)
+        self.cancel_action.triggered.connect(self.cancel_simulation)
+        self.cancel_action.setEnabled(False)
         actions = [
             ("Geometria betöltése", self.load_geometry_file),
             ("Projekt mentése", self.save_project_file),
@@ -143,12 +191,16 @@ class MainWindow(QMainWindow):
             ("Környezet ellenőrzése", self.check_installation_status),
             ("Diagnosztika", self.run_diagnostics),
             ("Szimuláció indítása", self.run_simulation),
+            ("Szimulacio megszakitasa", self.cancel_simulation),
             ("Eredmények exportálása", self.export_results),
             ("Animáció exportálása", self.export_animation),
         ]
         for title, callback in actions:
             action = QAction(title, self)
             action.triggered.connect(callback)
+            if title == "Szimulacio megszakitasa":
+                self.cancel_action = action
+                action.setEnabled(False)
             toolbar.addAction(action)
 
     def load_geometry_file(self) -> None:
@@ -169,8 +221,9 @@ class MainWindow(QMainWindow):
             return
         self.current_mesh = mesh
         self.current_geometry_info = geometry_info
-        self.preview_panel.set_mesh(mesh, geometry_info)
-        self.results_panel.show_geometry(mesh, geometry_info)
+        self.current_geometry_signature = self._geometry_signature(self.current_project)
+        self.preview_panel.set_mesh(mesh, geometry_info, project=self.current_project)
+        self.results_panel.show_geometry(mesh, geometry_info, project=self.current_project)
         self.log_panel.append("INFO", f"Geometria betöltve: {Path(path).name}")
         self.results_panel.append_log_copy(f"[INFO] Geometria betöltve: {Path(path).name}")
         self._update_mesh_plan()
@@ -196,8 +249,9 @@ class MainWindow(QMainWindow):
                 mesh, geometry_info = load_geometry(self.current_project)
                 self.current_mesh = mesh
                 self.current_geometry_info = geometry_info
-                self.preview_panel.set_mesh(mesh, geometry_info)
-                self.results_panel.show_geometry(mesh, geometry_info)
+                self.current_geometry_signature = self._geometry_signature(self.current_project)
+                self.preview_panel.set_mesh(mesh, geometry_info, project=self.current_project)
+                self.results_panel.show_geometry(mesh, geometry_info, project=self.current_project)
                 self._update_mesh_plan()
                 self._run_diagnostics(silent=True)
             self._refresh_runtime_status()
@@ -211,6 +265,9 @@ class MainWindow(QMainWindow):
         self._refresh_runtime_status(show_dialog=True, log_result=True)
 
     def run_simulation(self) -> None:
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            self._error("Mar fut egy szimulacio. Elobb allitsd le vagy vard meg a veget.")
+            return
         self.current_project = self.parameter_panel.project()
         if not self.current_project.geometry.file_path:
             self._error("Előbb válassz 3D geometriát.")
@@ -228,20 +285,33 @@ class MainWindow(QMainWindow):
         self.log_panel.set_status("Szimuláció indul", 0)
         self.log_panel.append("INFO", "Szimuláció indítása")
         self.results_panel.append_log_copy("[INFO] Szimuláció indítása")
+        self._set_simulation_running(True)
 
-        worker = SimulationWorker(self.current_project, self.current_mesh, self.current_geometry_info, self.current_mesh_plan)
+        self.worker = SimulationWorker(self.current_project, self.current_mesh, self.current_geometry_info, self.current_mesh_plan)
         thread = QThread(self)
-        worker.moveToThread(thread)
-        worker.progress.connect(self._on_progress)
-        worker.log.connect(self._on_worker_log)
-        worker.finished.connect(self._on_simulation_finished)
-        worker.failed.connect(self._on_simulation_failed)
-        thread.started.connect(worker.run)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
+        self.worker.moveToThread(thread)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.log.connect(self._on_worker_log)
+        self.worker.finished.connect(self._on_simulation_finished)
+        self.worker.failed.connect(self._on_simulation_failed)
+        self.worker.cancelled.connect(self._on_simulation_cancelled)
+        thread.started.connect(self.worker.run)
+        self.worker.finished.connect(thread.quit)
+        self.worker.failed.connect(thread.quit)
+        self.worker.cancelled.connect(thread.quit)
+        thread.finished.connect(self._on_worker_thread_finished)
+        thread.finished.connect(self.worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         self.worker_thread = thread
         thread.start()
+
+    def cancel_simulation(self, _checked: bool = False) -> None:
+        if self.worker is None or self.worker_thread is None or not self.worker_thread.isRunning():
+            return
+        self.log_panel.append("WARNING", "Megszakitas kerese elinditva.")
+        self.results_panel.append_log_copy("[WARNING] Megszakitas kerese elinditva.")
+        self.log_panel.set_status("Szimulacio megszakitasa folyamatban", 0)
+        self.worker.cancel()
 
     def export_results(self) -> None:
         if self.current_result is None:
@@ -293,7 +363,7 @@ class MainWindow(QMainWindow):
         if self.current_mesh is None or self.current_geometry_info is None:
             return
         self.current_mesh_plan = create_mesh_plan(self.current_project, self.current_geometry_info)
-        self.results_panel.show_mesh_plan(self.current_geometry_info, self.current_mesh_plan)
+        self.results_panel.show_mesh_plan(self.current_geometry_info, self.current_mesh_plan, project=self.current_project)
         summary = (
             f"RAM: {self.current_mesh_plan.estimated_memory_gb:.2f} GB | "
             f"Idő: {self.current_mesh_plan.estimated_runtime_minutes:.1f} perc | "
@@ -385,7 +455,7 @@ class MainWindow(QMainWindow):
 
     def _on_simulation_finished(self, result) -> None:
         self.current_result = result
-        self.results_panel.show_result(self.current_mesh, self.current_geometry_info, result)
+        self.results_panel.show_result(self.current_mesh, self.current_geometry_info, result, project=self.current_project)
         for message in result.messages:
             level = "WARNING" if result.synthetic else "INFO"
             self.log_panel.append(level, message)
@@ -402,6 +472,60 @@ class MainWindow(QMainWindow):
         self.log_panel.set_status("Hiba", 0)
         self.log_panel.append("ERROR", message)
         self.results_panel.append_log_copy(f"[ERROR] {message}")
+
+    def _on_simulation_cancelled(self, message: str) -> None:
+        self.log_panel.set_status("Szimulacio megszakitva", 0)
+        self.log_panel.append("WARNING", message)
+        self.results_panel.append_log_copy(f"[WARNING] {message}")
+
+    def _on_worker_thread_finished(self) -> None:
+        self._set_simulation_running(False)
+        self.worker_thread = None
+        self.worker = None
+
+    def _set_simulation_running(self, running: bool) -> None:
+        self.log_panel.set_running_state(running)
+        if self.cancel_action is not None:
+            self.cancel_action.setEnabled(running)
+
+    def _geometry_signature(self, project: ProjectModel) -> tuple:
+        return (
+            project.geometry.file_path,
+            project.geometry.unit,
+            project.geometry.scale,
+            project.geometry.rotation_deg,
+            project.geometry.position_m,
+            project.geometry.auto_repair,
+        )
+
+    def _on_parameters_changed(self) -> None:
+        self.current_project = self.parameter_panel.project()
+        self._refresh_runtime_status()
+
+        if not self.current_project.geometry.file_path:
+            return
+
+        geometry_signature = self._geometry_signature(self.current_project)
+        try:
+            if (
+                self.current_mesh is None
+                or self.current_geometry_info is None
+                or geometry_signature != self.current_geometry_signature
+            ):
+                geometry_path = Path(self.current_project.geometry.file_path)
+                if not geometry_path.exists():
+                    return
+                self.current_mesh, self.current_geometry_info = load_geometry(self.current_project)
+                self.current_geometry_signature = geometry_signature
+
+            if self.current_mesh is not None and self.current_geometry_info is not None:
+                self.preview_panel.set_mesh(self.current_mesh, self.current_geometry_info, project=self.current_project)
+                self.results_panel.show_geometry(self.current_mesh, self.current_geometry_info, project=self.current_project)
+                self._update_mesh_plan()
+                self._run_diagnostics(silent=True)
+        except Exception as exc:
+            self.log_panel.append("WARNING", f"Automatikus frissites hiba: {exc}")
+            self.results_panel.append_log_copy(f"[WARNING] Automatikus frissites hiba: {exc}")
 
     def _error(self, message: str) -> None:
         QMessageBox.critical(self, "Hiba", message)
