@@ -31,6 +31,8 @@ installer\Install-RobiRCS.cmd
 
 Részletek: installer/README.md
 
+Az installer most már akkor is ad visszajelzést, ha minden szükséges komponens már telepítve van, és a GUI-ban külön környezetellenőrzés is látható a főablakban.
+
 ## Megjegyzés
 
 Az alkalmazás GUI-ja és a teljes előkészítési pipeline helyben futtatható. A tényleges openEMS solver futtatáshoz külön telepített openEMS/CSXCAD Python környezet vagy külső parancs szükséges.

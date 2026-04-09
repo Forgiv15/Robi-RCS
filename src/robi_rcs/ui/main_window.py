@@ -24,7 +24,13 @@ from robi_rcs.services.backend import (
     prepare_openems_job,
     run_openems_job,
 )
-from robi_rcs.services.diagnostics import build_preflight_report, format_preflight_report, inspect_openems_backend
+from robi_rcs.services.diagnostics import (
+    build_preflight_report,
+    format_preflight_report,
+    format_runtime_status,
+    inspect_openems_backend,
+    inspect_runtime_status,
+)
 from robi_rcs.services.export_service import export_report_bundle, load_project, save_project
 from robi_rcs.services.runtime_env import prepare_openems_runtime
 from robi_rcs.ui.widgets import LogPanel, ParameterPanel, PreviewPanel, ResultsPanel
@@ -96,6 +102,7 @@ class MainWindow(QMainWindow):
         self.current_mesh_plan = None
         self.current_result = None
         self.current_preflight_report = None
+        self.current_runtime_status = None
         self.worker_thread: QThread | None = None
 
         backend_status = inspect_openems_backend("")
@@ -105,6 +112,8 @@ class MainWindow(QMainWindow):
         self._build_layout()
         self._build_actions()
         self.parameter_panel.apply_project(self.current_project)
+        self.parameter_panel.openems_python.editingFinished.connect(self._refresh_runtime_status)
+        self._refresh_runtime_status()
 
     def _build_layout(self) -> None:
         horizontal = QSplitter()
@@ -131,6 +140,7 @@ class MainWindow(QMainWindow):
             ("Geometria betöltése", self.load_geometry_file),
             ("Projekt mentése", self.save_project_file),
             ("Projekt betöltése", self.load_project_file),
+            ("Környezet ellenőrzése", self.check_installation_status),
             ("Diagnosztika", self.run_diagnostics),
             ("Szimuláció indítása", self.run_simulation),
             ("Eredmények exportálása", self.export_results),
@@ -190,11 +200,15 @@ class MainWindow(QMainWindow):
                 self.results_panel.show_geometry(mesh, geometry_info)
                 self._update_mesh_plan()
                 self._run_diagnostics(silent=True)
+            self._refresh_runtime_status()
         except Exception as exc:
             self._error(str(exc))
 
     def run_diagnostics(self, _checked: bool = False) -> None:
         self._run_diagnostics(silent=False)
+
+    def check_installation_status(self, _checked: bool = False) -> None:
+        self._refresh_runtime_status(show_dialog=True, log_result=True)
 
     def run_simulation(self) -> None:
         self.current_project = self.parameter_panel.project()
@@ -297,7 +311,8 @@ class MainWindow(QMainWindow):
                 self._error("A diagnosztikához előbb tölts be geometriát.")
             return False
 
-        backend_status = inspect_openems_backend(self.current_project.solver.openems_python_command)
+        runtime_status = self._refresh_runtime_status()
+        backend_status = runtime_status.backend_status
         self.current_preflight_report = build_preflight_report(
             self.current_project,
             self.current_geometry_info,
@@ -322,6 +337,44 @@ class MainWindow(QMainWindow):
                 self._error("\n".join(item.summary for item in self.current_preflight_report.issues[:3]))
             return False
         return True
+
+    def _refresh_runtime_status(self, show_dialog: bool = False, log_result: bool = False):
+        self.current_project = self.parameter_panel.project()
+        runtime_status = inspect_runtime_status(self.current_project.solver.openems_python_command)
+        self.current_runtime_status = runtime_status
+
+        if runtime_status.openems_ready and runtime_status.backend_status.executable and not self.current_project.solver.openems_python_command.strip():
+            self.current_project.solver.openems_python_command = runtime_status.backend_status.executable
+            self.parameter_panel.openems_python.setText(runtime_status.backend_status.executable)
+
+        details = [
+            f"GUI környezet: {'rendben' if runtime_status.ui_ready else 'hiányos'}",
+            f"openEMS backend: {'használható' if runtime_status.openems_ready else 'nem használható'}",
+        ]
+        if runtime_status.backend_status.executable:
+            details.append(f"Solver Python: {runtime_status.backend_status.executable}")
+        details.extend(runtime_status.notes[:2])
+
+        self.parameter_panel.set_installation_status(
+            runtime_status.summary,
+            details,
+            runtime_status.overall_ready,
+            runtime_status.ui_ready,
+            runtime_status.openems_ready,
+        )
+        self.results_panel.show_installation_status(format_runtime_status(runtime_status))
+
+        if log_result:
+            level = "INFO" if runtime_status.overall_ready else "WARNING"
+            self.log_panel.append(level, runtime_status.summary)
+            self.results_panel.append_log_copy(f"[{level}] {runtime_status.summary}")
+
+        if show_dialog:
+            if runtime_status.overall_ready:
+                QMessageBox.information(self, "Rendszer állapot", format_runtime_status(runtime_status))
+            else:
+                QMessageBox.warning(self, "Rendszer állapot", format_runtime_status(runtime_status))
+        return runtime_status
 
     def _on_progress(self, value: int, message: str) -> None:
         self.log_panel.set_status(message, value)

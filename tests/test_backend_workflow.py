@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -9,9 +10,10 @@ import trimesh
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from robi_rcs.services.backend import create_mesh_plan, create_synthetic_result, load_geometry
-from robi_rcs.services.diagnostics import build_preflight_report, inspect_openems_backend
+from robi_rcs.services.diagnostics import build_preflight_report, inspect_openems_backend, inspect_runtime_status
 from robi_rcs.models import ProjectModel
 
 
@@ -39,6 +41,15 @@ class BackendWorkflowTest(unittest.TestCase):
             self.assertFalse(preflight.issues)
             self.assertGreater(len(result.frequencies_hz), 10)
             self.assertTrue(result.synthetic)
+
+    def test_runtime_status_reports_gui_and_backend_state(self) -> None:
+        runtime_status = inspect_runtime_status("")
+
+        self.assertTrue(runtime_status.ui_ready)
+        self.assertTrue(runtime_status.openems_ready)
+        self.assertTrue(runtime_status.overall_ready)
+        self.assertTrue(runtime_status.summary)
+        self.assertGreaterEqual(len(runtime_status.dependencies), 5)
 
 
 if __name__ == "__main__":

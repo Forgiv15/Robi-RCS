@@ -264,6 +264,8 @@ class ResultsPanel(QWidget):
 
         self.geometry_preview = PreviewPanel("Geometry")
         self.mesh_preview = PreviewPanel("Mesh / Domain")
+        self.installation_view = QTextEdit()
+        self.installation_view.setReadOnly(True)
         self.runtime_summary = QTextEdit()
         self.runtime_summary.setReadOnly(True)
         self.rcs_plot = pg.PlotWidget()
@@ -289,6 +291,7 @@ class ResultsPanel(QWidget):
 
         self.tabs.addTab(self.geometry_preview, "Geometria")
         self.tabs.addTab(self.mesh_preview, "Mesh")
+        self.tabs.addTab(self.installation_view, "Környezet")
         self.tabs.addTab(self.runtime_summary, "Futási állapot")
         self.tabs.addTab(self.rcs_plot, "RCS vs frekvencia")
         self.tabs.addTab(self.pol_plot, "Polarizáció")
@@ -321,6 +324,9 @@ class ResultsPanel(QWidget):
                 ]
             )
         )
+
+    def show_installation_status(self, text: str) -> None:
+        self.installation_view.setPlainText(text)
 
     def show_result(self, mesh, geometry_info, result) -> None:
         self.rcs_plot.clear()
@@ -376,6 +382,7 @@ class ResultsPanel(QWidget):
                 exported.append(image_path)
 
         text_exports = {
+            "installation_status.txt": self.installation_view.toPlainText(),
             "runtime_summary.txt": self.runtime_summary.toPlainText(),
             "diagnostics.txt": self.diagnostics_view.toPlainText(),
             "export_notes.txt": self.export_notes.toPlainText(),
@@ -403,7 +410,16 @@ class ParameterPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         outer = QVBoxLayout(self)
+        status_group = QGroupBox("Rendszer állapot")
+        status_layout = QVBoxLayout(status_group)
+        self.install_summary = QLabel("Telepítési állapot ellenőrzése...")
+        self.install_summary.setWordWrap(True)
+        self.install_detail = QLabel("A GUI és az openEMS állapota itt jelenik meg.")
+        self.install_detail.setWordWrap(True)
+        status_layout.addWidget(self.install_summary)
+        status_layout.addWidget(self.install_detail)
         self.toolbox = QToolBox()
+        outer.addWidget(status_group)
         outer.addWidget(self.toolbox)
 
         self.project_name = QLineEdit("Untitled Project")
@@ -661,6 +677,24 @@ class ParameterPanel(QWidget):
 
     def set_geometry_path(self, path: str) -> None:
         self.geometry_path.setText(path)
+
+    def set_installation_status(
+        self,
+        summary: str,
+        details: list[str],
+        overall_ready: bool,
+        ui_ready: bool,
+        openems_ready: bool,
+    ) -> None:
+        if overall_ready:
+            color = "#166534"
+        elif ui_ready and not openems_ready:
+            color = "#b45309"
+        else:
+            color = "#b91c1c"
+        self.install_summary.setText(summary)
+        self.install_summary.setStyleSheet(f"color: {color}; font-weight: 600;")
+        self.install_detail.setText("\n".join(details))
 
     def _make_form(self, title: str, rows: list[tuple[str, QWidget]]) -> QWidget:
         container = QGroupBox(title)

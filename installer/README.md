@@ -13,6 +13,11 @@ Ha dupla kattintás után az ablak korábban túl gyorsan bezárult, az új verz
 
 - `%TEMP%\RobiRCSInstaller.log`
 
+Siker esetén is kapsz látható visszajelzést:
+
+- ha minden már telepítve van, a telepítő kiírja, hogy nincs további teendő
+- ha most telepített, felugró ablak jelzi, hogy az openEMS is használható
+
 ## Mit csinál
 
 - bemásolja az alkalmazást a `LocalAppData\Programs\Robi RCS` mappába
@@ -21,6 +26,7 @@ Ha dupla kattintás után az ablak korábban túl gyorsan bezárult, az új verz
 - telepíti a mellékelt openEMS és CSXCAD wheel-eket
 - beállítja az `OPENEMS_INSTALL_PATH` user környezeti változót
 - létrehoz indító parancsfájlt és Windows shortcutokat
+- a végén utóellenőrzi, hogy a GUI csomagok és az openEMS importálható-e
 
 ## Python követelmény
 

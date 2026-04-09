@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 
-from robi_rcs.models import BackendStatus, GeometryInfo, MeshPlan, PreflightReport, ProjectModel, ValidationMessage
-from robi_rcs.services.runtime_env import prepare_openems_runtime
+from robi_rcs.models import (
+    BackendStatus,
+    DependencyStatus,
+    GeometryInfo,
+    MeshPlan,
+    PreflightReport,
+    ProjectModel,
+    RuntimeStatus,
+    ValidationMessage,
+)
+from robi_rcs.services.runtime_env import detect_openems_root, prepare_openems_runtime
 
 
 BACKEND_INSPECTION_SNIPPET = """
@@ -33,6 +43,27 @@ print(json.dumps({
     "origins": origins,
 }))
 """.strip()
+
+RUNTIME_DEPENDENCIES = [
+    ("PySide6", "PySide6 / Qt6 GUI"),
+    ("numpy", "NumPy numerikus mag"),
+    ("trimesh", "Trimesh geometria import"),
+    ("gmsh", "Gmsh mesh előkészítés"),
+    ("pyvista", "PyVista 3D megjelenítés"),
+    ("pyvistaqt", "PyVistaQt Qt kapcsolat"),
+    ("pyqtgraph", "PyQtGraph grafikonok"),
+    ("imageio", "ImageIO export"),
+]
+
+
+def _spec_location(spec: importlib.machinery.ModuleSpec | None) -> str:
+    if spec is None:
+        return "Nem található a jelenlegi Python környezetben."
+    if spec.origin and spec.origin != "namespace":
+        return spec.origin
+    if spec.submodule_search_locations:
+        return str(next(iter(spec.submodule_search_locations), ""))
+    return "Elérhető, de a pontos helye nem olvasható ki."
 
 
 def inspect_openems_backend(python_command: str) -> BackendStatus:
@@ -80,6 +111,87 @@ def inspect_openems_backend(python_command: str) -> BackendStatus:
         version=str(payload.get("version", "")),
         details=details,
     )
+
+
+def inspect_runtime_status(python_command: str) -> RuntimeStatus:
+    prepare_openems_runtime()
+    backend_status = inspect_openems_backend(python_command)
+    dependencies: list[DependencyStatus] = []
+    ui_ready = True
+
+    for module_name, label in RUNTIME_DEPENDENCIES:
+        spec = importlib.util.find_spec(module_name)
+        available = spec is not None
+        dependencies.append(DependencyStatus(name=label, available=available, details=_spec_location(spec)))
+        ui_ready = ui_ready and available
+
+    openems_root = detect_openems_root()
+    notes: list[str] = []
+    if openems_root is not None:
+        notes.append(f"Bundled openEMS könyvtár: {openems_root}")
+    else:
+        notes.append("Bundled openEMS könyvtár nem található automatikusan.")
+
+    if backend_status.available:
+        notes.append("Az openEMS backend importálható, a valós solver futtatható.")
+    else:
+        notes.append("Az openEMS backend jelenleg nem használható ebből a beállításból.")
+
+    overall_ready = ui_ready and backend_status.available
+    if overall_ready:
+        summary = "A program és az openEMS használatra kész."
+    elif ui_ready:
+        summary = "A program elindul, de az openEMS backend még nem használható."
+    else:
+        summary = "Hiányzó vagy sérült Python csomagok miatt a GUI környezet nem teljes."
+
+    return RuntimeStatus(
+        summary=summary,
+        overall_ready=overall_ready,
+        ui_ready=ui_ready,
+        openems_ready=backend_status.available,
+        python_executable=sys.executable,
+        openems_root=str(openems_root) if openems_root is not None else "",
+        backend_status=backend_status,
+        dependencies=dependencies,
+        notes=notes,
+    )
+
+
+def format_runtime_status(status: RuntimeStatus) -> str:
+    lines = [
+        f"Általános állapot: {status.summary}",
+        "",
+        f"GUI környezet: {'rendben' if status.ui_ready else 'hiányos'}",
+        f"openEMS backend: {'használható' if status.openems_ready else 'nem használható'}",
+        f"UI Python: {status.python_executable}",
+    ]
+    if status.backend_status.executable:
+        lines.append(f"Solver Python: {status.backend_status.executable}")
+    if status.openems_root:
+        lines.append(f"Bundled openEMS: {status.openems_root}")
+
+    lines.append("")
+    lines.append("Komponensek:")
+    for dependency in status.dependencies:
+        lines.append(f"- {dependency.name}: {'OK' if dependency.available else 'HIÁNYZIK'}")
+        if dependency.details:
+            lines.append(f"  {dependency.details}")
+
+    lines.append("")
+    lines.append("openEMS részletek:")
+    if status.backend_status.details:
+        for detail in status.backend_status.details:
+            lines.append(f"- {detail}")
+    else:
+        lines.append("- nincs további részlet")
+
+    if status.notes:
+        lines.append("")
+        lines.append("Megjegyzések:")
+        for note in status.notes:
+            lines.append(f"- {note}")
+    return "\n".join(lines)
 
 
 def build_preflight_report(

@@ -110,6 +110,26 @@ class BackendStatus:
 
 
 @dataclass(slots=True)
+class DependencyStatus:
+    name: str
+    available: bool
+    details: str = ""
+
+
+@dataclass(slots=True)
+class RuntimeStatus:
+    summary: str = ""
+    overall_ready: bool = False
+    ui_ready: bool = False
+    openems_ready: bool = False
+    python_executable: str = ""
+    openems_root: str = ""
+    backend_status: BackendStatus = field(default_factory=BackendStatus)
+    dependencies: list[DependencyStatus] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class PreflightReport:
     issues: list[ValidationMessage] = field(default_factory=list)
     warnings: list[ValidationMessage] = field(default_factory=list)
