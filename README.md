@@ -15,6 +15,8 @@ Vagy Windows alatt közvetlenül:
 Run-RobiRCS.cmd
 ```
 
+Ha a kibontott projektmappaban nincs helyi `.venv`, a `Run-RobiRCS.cmd` most automatikusan megprobal atvaltani a telepitett `LocalAppData\Programs\Robi RCS` peldanyra.
+
 ## Tesztelés
 
 ```powershell
